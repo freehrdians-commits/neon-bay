@@ -1,134 +1,198 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Boot and the one loop for Neon Bay: input is read every frame, the world
+// advances in fixed 1/60 s steps, and the renderer paints what is there. The
+// game moves between five screens — title, play, paused, complete and
+// game over — with mission briefings as dialogs that freeze the world.
+// ?seed=N fixes the city; ?shot=start|play|chase|end stages that scene for
+// a screenshot and sets window.__shotReady.
+import { MISSIONS } from './missions.js';
+import { SoundBank } from './audio.js';
+import { Input } from './input.js';
+import { createWorld, stepWorld, interact, punch, shoot, snapshot } from './world.js';
+import { createRenderer, titleButtonAt, cameraFor } from './render.js';
 import { stageShot } from './shots.js';
+import { readSave, writeSave, hasSave } from './save.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
+const STEP = 1 / 60;
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
+const shotName = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const statusEl = document.getElementById('status');
+const input = new Input(canvas);
 const renderer = createRenderer(canvas);
+const sfx = new SoundBank();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+let world = createWorld(seed);
+let prevMission = 0;
+let prevStage = 0;
+let prevCash = 0;
+let prevAmmo = 12;
+let prevHealth = 100;
+
+function announce(message) {
+  if (statusEl) statusEl.textContent = message;
+}
+
+function startNewGame() {
+  world = createWorld(seed);
+  world.screen = 'play';
+  const m = MISSIONS[0];
+  world.dialog = { title: m.title, speaker: m.speaker, lines: m.briefing };
+  prevMission = 0;
+  prevStage = 0;
+  prevCash = 0;
+  prevAmmo = 12;
+  prevHealth = 100;
+  announce('Playing Neon Bay. First Job: pick up the package at the docks.');
+}
+
+function continueGame() {
+  const save = readSave();
+  if (!save) return;
+  world = createWorld(seed, save);
+  world.screen = 'play';
+  world.dialog = null;
+  prevMission = world.missionIndex;
+  prevStage = world.missionStage;
+  prevCash = world.cash;
+  prevAmmo = world.player.ammo;
+  prevHealth = world.player.health;
+  announce('Continuing Neon Bay.');
+}
+
+function backToTitle() {
+  world = createWorld(seed);
+  world.screen = 'title';
+  announce('Neon Bay. Press Enter to start.');
+}
+
+// Sounds follow what changed since the last frame.
+function watchChanges() {
+  const w = world;
+  if (w.cash > prevCash) {
+    sfx.cash();
+    if (w.missionIndex !== prevMission) sfx.jingle();
+  } else if (w.missionIndex !== prevMission || w.missionStage !== prevStage) {
+    if (w.missionStage === 1 && w.missionIndex === prevMission) sfx.pickup();
+    else if (w.missionIndex !== prevMission) sfx.jingle();
+  }
+  if (w.gameOver === 'busted' && prevHealth > 0) sfx.busted();
+  prevMission = w.missionIndex;
+  prevStage = w.missionStage;
+  prevCash = w.cash;
+  prevAmmo = w.player.ammo;
+  prevHealth = w.player.health;
+}
+
+function handleInput() {
+  const w = world;
+  sfx.unlock();
+  if (input.wasPressed('Enter', 'Space')) {
+    if (w.dialog) {
+      w.dialog = null;
+    } else if (w.screen === 'title') {
+      startNewGame();
+    } else if (w.screen === 'gameover' || w.screen === 'complete') {
+      backToTitle();
+    }
+    return;
+  }
+  if (input.wasPressed('Escape')) {
+    if (w.screen === 'play' && !w.dialog) w.screen = 'paused';
+    else if (w.screen === 'paused') w.screen = 'play';
+    return;
+  }
+  if (w.screen === 'title') {
+    if (input.mouseClicked) {
+      const button = titleButtonAt(input.mouseX, input.mouseY, hasSave());
+      if (button === 'new') startNewGame();
+      else if (button === 'continue') continueGame();
+    }
+    return;
+  }
+  if (w.screen === 'paused') {
+    if (input.wasPressed('KeyS')) writeSave(w);
+    return;
+  }
+  if (w.screen !== 'play' || w.dialog) return;
+  if (input.wasPressed('KeyE')) interact(w);
+  if (input.wasPressed('KeyF')) {
+    if (punch(w)) sfx.punch();
+  }
+  if (input.mouseDown) {
+    const cam = cameraFor(w);
+    if (shoot(w, input.mouseX + cam.x, input.mouseY + cam.y)) sfx.gunshot();
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+function frame(now) {
   requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, MAX_FRAME);
+  last = now;
+  handleInput();
+  const w = world;
+  if (shotName) {
+    // Shot scenes: drive forward on the play and chase scenes so the frame
+    // has motion; the title and end scenes just sit.
+    const fake = shotName === 'play' || shotName === 'chase'
+      ? { down: (...codes) => codes.includes('KeyW') }
+      : { down: () => false };
+    if (w.screen === 'play' && !w.dialog) stepWorld(w, fake, STEP);
+    else if (w.screen === 'title') stepWorld(w, { down: () => false }, STEP);
+  } else if (w.screen === 'play' && !w.dialog) {
+    accumulator += dt;
+    while (accumulator >= STEP) {
+      stepWorld(w, input, STEP);
+      accumulator -= STEP;
+    }
+    if (w.gameOver === 'complete' || w.gameOver === 'busted') {
+      // The world already set the screen; auto-save the ending.
+      writeSave(w);
+    }
+  } else if (w.screen === 'title') {
+    accumulator += dt;
+    while (accumulator >= STEP) {
+      stepWorld(w, { down: () => false }, STEP);
+      accumulator -= STEP;
+    }
+  } else {
+    accumulator = 0;
+  }
+  // Continuous sounds: engine hum and the police siren.
+  const p = w.player;
+  sfx.setEngine(p.inCar && p.car ? Math.abs(p.car.speed) / p.car.maxSpeed : 0, p.inCar);
+  const nearCop = w.cars.some((c) => c.kind === 'police' && Math.hypot(c.x - p.x, c.y - p.y) < 600);
+  sfx.setSiren(nearCop, STEP);
+  watchChanges();
+  renderer.draw(w, hasSave());
+  input.endFrame();
+  if (shotName) {
+    painted += 1;
+    if (painted >= 2 && !window.__shotReady) window.__shotReady = true;
+  }
 }
 
-if (shot) runShot(shot);
-else runGame();
+let accumulator = 0;
+let last = performance.now();
+let painted = 0;
+
+// The test and screenshot interface: a plain snapshot of the world.
+window.NB = {
+  snapshot: () => snapshot(world),
+  get state() {
+    return world;
+  },
+};
+
+if (shotName) {
+  stageShot(shotName, world);
+  world.time = 0;
+  announce(`Neon Bay screenshot scene: ${shotName}.`);
+} else {
+  announce('Neon Bay. Press Enter or click New Game to start.');
+}
+requestAnimationFrame(frame);
