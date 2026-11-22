@@ -29,6 +29,8 @@ export function stageShot(name, state) {
     state.timeOfDay = 0.3;
     const car = state.cars.find((c) => c.driver === 'none' && !c.gold);
     if (car) putPlayerInCar(state, car, 580, 852, 0);
+    // The neon tags are all uncollected here: one glints on the sidewalk
+    // just south of the car, inside this frame.
     return;
   }
   if (name === 'chase') {
@@ -36,7 +38,7 @@ export function stageShot(name, state) {
     state.timeOfDay = 0.58;
     state.missionIndex = 1;
     state.missionStage = 1;
-    state.wanted = 3;
+    state.wanted = 4;
     state.lastHeat = state.time;
     ensureGoldCar(state);
     const gold = state.cars.find((c) => c.gold);
@@ -55,16 +57,26 @@ export function stageShot(name, state) {
         route: null, routeTimer: 0, routeIndex: 0,
       });
     });
+    // And a roadblock waiting ahead on the same road.
+    state.cars.push({
+      id: 9010, x: 1080, y: 562, angle: Math.PI / 2, speed: 0,
+      maxSpeed: 0, accel: 0, brake: 620, reverseMax: 130, turn: 3.0,
+      kind: 'police', driver: 'police', color: '#1c2733', gold: false,
+      axis: 'h', road: 2, dir: 1, targetSpeed: 0, ramCd: 0,
+      route: null, routeTimer: 0, routeIndex: 0, roadblock: true,
+    });
     return;
   }
   if (name === 'end') {
     state.screen = 'complete';
     state.gameOver = 'complete';
     state.timeOfDay = 0.4;
-    state.cash = 2900;
-    state.missionsDone = 3;
-    state.missionIndex = 2;
+    state.cash = 4700;
+    state.missionsDone = 4;
+    state.missionIndex = 3;
     state.missionStage = 1;
+    state.tagsCollected = 8;
+    state.tags = state.tags.map(() => true);
     state.player.x = MARKERS.garage.x;
     state.player.y = MARKERS.garage.y;
     return;

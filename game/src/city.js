@@ -70,6 +70,7 @@ export const MARKERS = {
   chopshop: { x: 1124, y: 1260, label: 'Chop Shop' },
   plaza: { x: 716, y: 716, label: 'Crescent Plaza' },
   park: { x: 988, y: 444, label: 'Palm Park' },
+  lookout: { x: 1260, y: 172, label: "Rook's Lookout" },
 };
 
 // Build the blocks: every block gets one or two buildings, inset from the
@@ -135,7 +136,21 @@ export function buildCity(rng) {
       }
     }
   }
-  return { buildings, trees, crates };
+  // Neon signs on the faces of a few buildings: they glow after dark and
+  // give the city its name at night. Anchored to real buildings, so a given
+  // seed always builds the same signs on the same walls.
+  const signTexts = ['NEON', 'BAY', '24H', 'DINE', 'HOTEL'];
+  const signColors = ['#ff4fd8', '#2ee6ff', '#ffd21f', '#ff7a3d', '#7be382'];
+  const signs = [];
+  for (let i = 0; i < 5; i++) {
+    const b = buildings[i * 3];
+    if (!b) continue;
+    signs.push({
+      x: b.x + b.w / 2, y: b.y - 2,
+      text: signTexts[i], color: signColors[i],
+    });
+  }
+  return { buildings, trees, crates, signs };
 }
 
 // Is point (x, y) inside a road band (either axis)?

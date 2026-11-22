@@ -10,7 +10,7 @@ import {
   nearestRoadIndex, routeWaypoints, angleDiff, dist, clamp,
   collideBuildings,
 } from './city.js';
-import { makeRng, range, pick, shuffle } from './rng.js';
+import { makeRng, range, pick, shuffle, weightedPick, gauss } from './rng.js';
 import { MISSIONS, objectiveFor as missionObjective } from './missions.js';
 
 export const WALK_SPEED = 150;
@@ -23,6 +23,27 @@ export const RIVAL_SPEED = 95;
 export const INTERACT_RADIUS = 75;
 export const ENTER_RADIUS = 55;
 export const WANTED_DECAY_SECONDS = 12;
+export const WANTED_DECAY_SECONDS_NIGHT = 18;
+export const TAG_RADIUS = 32;
+export const TAG_REWARD = 25;
+export const TAG_BONUS = 100;
+export const NITRO_DRAIN = 42;
+export const NITRO_REFILL = 14;
+export const NITRO_BOOST = 1.3;
+
+// Eight neon tags hidden on sidewalks around the city, at fixed spots so a
+// given seed always hides them in the same places. Collecting one pays $25;
+// all eight pay a $100 bonus from Delia.
+export const TAG_SPOTS = [
+  { x: 82, y: 500 },
+  { x: 354, y: 200 },
+  { x: 626, y: 1100 },
+  { x: 898, y: 300 },
+  { x: 1170, y: 900 },
+  { x: 1350, y: 700 },
+  { x: 500, y: 82 },
+  { x: 1000, y: 626 },
+];
 
 const CAR_COLORS = ['#c94f3d', '#3d7dc9', '#d8b13a', '#7a9a4d', '#8a5fc0', '#c9c9c9', '#3a3a3a', '#d97b2e'];
 const PED_COLORS = ['#e8b04b', '#7fb3d5', '#c98bb0', '#8bc98f', '#d5d5d5', '#b08a5a'];
@@ -63,7 +84,7 @@ export function createWorld(seed, saveData) {
     player: {
       x: MARKERS.garage.x, y: MARKERS.garage.y, angle: -Math.PI / 2,
       health: 100, ammo: 12, inCar: false, car: null, speed: 0,
-      punchCd: 0, shootCd: 0, invuln: 0, moving: false,
+      punchCd: 0, shootCd: 0, invuln: 0, moving: false, nitro: 100,
     },
     cars: [],
     peds: [],
@@ -72,6 +93,10 @@ export function createWorld(seed, saveData) {
     bullets: [],
     pickups: [],
     particles: [],
+    tags: TAG_SPOTS.map(() => false),
+    tagsCollected: 0,
+    tagBonusPaid: false,
+    courierSpotted: false,
     stats: { shotsFired: 0, carsStolen: 0, rivalsDown: 0 },
     _policeRouteTimer: 0,
   };
@@ -96,8 +121,13 @@ function applySave(state, data) {
   state.player.ammo = data.ammo ?? 12;
   state.wanted = data.wanted || 0;
   state.timeOfDay = data.timeOfDay ?? 0.32;
+  state.tagsCollected = data.tags || 0;
+  state.tags = TAG_SPOTS.map((_, i) => i < state.tagsCollected);
+  state.tagBonusPaid = state.tagsCollected >= TAG_SPOTS.length;
   if (state.missionIndex >= 1) ensureGoldCar(state);
   if (state.missionIndex >= 2) ensureRivals(state);
+  // The courier only drives while the ledger is still in his car.
+  if (state.missionIndex >= 3 && state.missionStage === 0) ensureCourier(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +246,13 @@ function spawnWalkers(state) {
 }
 
 function spawnPickups(state) {
-  const kinds = ['health', 'ammo', 'cash', 'health', 'ammo', 'cash'];
-  for (const kind of kinds) {
+  // Weighted kinds: cash shows up a little more often than health or ammo.
+  for (let i = 0; i < 6; i++) {
+    const kind = weightedPick(state.rng, [
+      { value: 'health', weight: 0.3 },
+      { value: 'ammo', weight: 0.3 },
+      { value: 'cash', weight: 0.4 },
+    ]);
     state.pickups.push({ ...randomSidewalkSpot(state), kind, timer: 0 });
   }
 }
@@ -258,6 +293,27 @@ export function ensureRivals(state) {
       homeX: s.x, homeY: s.y,
     });
   }
+}
+
+// Marlow's courier: a black Comet with the ledger in the boot, driving the
+// roads of Neon Bay. He cruises until the player gets close, then runs —
+// and he stalls for a few seconds when the player jumps out of a car right
+// in front of him, which is the moment to grab the ledger on foot.
+export function ensureCourier(state) {
+  if (state.cars.some((c) => c.kind === 'courier')) return;
+  const spot = randomRoadSpot(state);
+  const dir = pick(state.rng, [-1, 1]);
+  const car = makeCar(state, {
+    x: spot.axis === 'v' ? roadCenter(spot.road) + laneOffset('v', dir) : spot.x,
+    y: spot.axis === 'h' ? roadCenter(spot.road) + laneOffset('h', dir) : spot.y,
+    angle: angleFor(spot.axis, dir),
+    kind: 'courier', driver: 'npc', color: '#14161c',
+    axis: spot.axis, road: spot.road, dir,
+    maxSpeed: 320, accel: 380, targetSpeed: 150,
+  });
+  car.speed = car.targetSpeed;
+  car.stall = 0;
+  return car;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,11 +381,36 @@ export function interact(state) {
     }
     return;
   }
+  // 1b. The ledger: cut the courier off on foot and grab it. The courier
+  // stalls when the player jumps out of a car in front of him, and he
+  // hesitates when the player is right beside him — that is the window.
+  if (state.missionIndex === 3 && state.missionStage === 0) {
+    const courier = state.cars.find((c) => c.kind === 'courier');
+    if (courier && dist(p.x, p.y, courier.x, courier.y) < 60) {
+      state.missionStage = 1;
+      courier.driver = 'none';
+      courier.kind = 'parked';
+      courier.speed = 0;
+      courier.targetSpeed = 0;
+      // The courier bails out and runs.
+      state.peds.push({
+        x: courier.x, y: courier.y, angle: courier.angle, speed: 150,
+        color: '#14161c', axis: 'h', road: 0, dir: 1, wander: 3, fleeing: true,
+      });
+      state.wanted = Math.max(state.wanted, 3);
+      state.lastHeat = state.time;
+      state.wantedTimer = 0;
+      addToast(state, 'Ledger grabbed — the Vipers know. Get it to the docks!');
+      spawnParticles(state, courier.x, courier.y, 10, '#ffd21f', 150);
+      return;
+    }
+  }
   // 2. The nearest car within reach.
   let best = null;
   let bestD = ENTER_RADIUS;
   for (const car of state.cars) {
     if (car.kind === 'police' || car.driver === 'player') continue;
+    if (car.kind === 'courier') continue; // the ledger car is taken on foot, not driven off
     if (car.kind === 'traffic' && Math.abs(car.speed) > 60) continue;
     const d = dist(p.x, p.y, car.x, car.y);
     if (d < bestD) {
@@ -342,7 +423,8 @@ export function interact(state) {
 
 function enterCar(state, car) {
   const p = state.player;
-  if (car.driver === 'npc') {
+  const hadDriver = car.driver === 'npc';
+  if (hadDriver) {
     // The driver bails out and runs off on foot.
     state.peds.push({
       x: car.x, y: car.y, angle: car.angle, speed: 130,
@@ -355,6 +437,13 @@ function enterCar(state, car) {
     state.lastHeat = state.time;
     state.wantedTimer = 0;
     addToast(state, 'Stolen! Wanted level 2 — lose the cops and reach the Chop Shop');
+  } else if (hadDriver) {
+    // Stealing a car is a crime — but only if a cop sees it happen.
+    const seen = state.cars.some((c) => c.kind === 'police' && dist(c.x, c.y, car.x, car.y) < 350);
+    if (seen) {
+      raiseWanted(state, 1);
+      addToast(state, 'Seen stealing — the cops are coming');
+    }
   }
   car.driver = 'player';
   car.kind = 'player';
@@ -373,7 +462,7 @@ function exitCar(state) {
     return;
   }
   car.driver = 'none';
-  car.kind = car.gold ? 'parked' : 'parked';
+  car.kind = 'parked';
   car.speed = 0;
   // Step out to the car's left side, clear of its doors.
   const side = -Math.PI / 2;
@@ -385,6 +474,14 @@ function exitCar(state) {
   p.inCar = false;
   p.car = null;
   p.speed = 0;
+  // Jumping out right in front of the courier stalls him for a few
+  // seconds — the window to grab the ledger on foot.
+  if (state.missionIndex === 3 && state.missionStage === 0) {
+    const courier = state.cars.find((c) => c.kind === 'courier');
+    if (courier && dist(p.x, p.y, courier.x, courier.y) < 200) {
+      courier.stall = 3;
+    }
+  }
 }
 
 export function punch(state) {
@@ -462,7 +559,7 @@ export function completeMission(state) {
   state.cash += m.reward;
   state.missionsDone += 1;
   clearWanted(state);
-  if (state.missionIndex >= 2) {
+  if (state.missionIndex >= 3) {
     state.gameOver = 'complete';
     state.screen = 'complete';
     return;
@@ -472,6 +569,7 @@ export function completeMission(state) {
   const next = MISSIONS[state.missionIndex];
   if (state.missionIndex === 1) ensureGoldCar(state);
   if (state.missionIndex === 2) ensureRivals(state);
+  if (state.missionIndex === 3) ensureCourier(state);
   state.dialog = {
     title: next.title,
     speaker: next.speaker,
@@ -500,6 +598,7 @@ export function stepWorld(state, input, dt) {
   stepPolice(state, dt);
   stepBullets(state, dt);
   stepPickups(state, dt);
+  stepTags(state, dt);
   stepParticles(state, dt);
   stepWanted(state, dt);
 
@@ -511,11 +610,16 @@ export function stepWorld(state, input, dt) {
 
 function stepPlayer(state, input, dt) {
   const p = state.player;
+  // The nitro meter refills whenever the player is not boosting — including
+  // on foot between chases — so a spent meter is never a dead end.
+  const boosting = p.inCar && p.car && (input.boost ? input.boost() : input.down('ShiftLeft', 'ShiftRight'));
+  if (!boosting) p.nitro = Math.min(100, p.nitro + NITRO_REFILL * dt);
   if (p.inCar && p.car) {
     const car = p.car;
     const throttle = input.down('KeyW', 'ArrowUp') ? 1 : input.down('KeyS', 'ArrowDown') ? -1 : 0;
     const steer = input.down('KeyD', 'ArrowRight') ? 1 : input.down('KeyA', 'ArrowLeft') ? -1 : 0;
-    stepCarPhysics(state, car, throttle, steer, dt);
+    const boost = input.boost ? input.boost() : input.down('ShiftLeft', 'ShiftRight');
+    stepCarPhysics(state, car, throttle, steer, dt, boost);
     p.x = car.x;
     p.y = car.y;
     p.angle = car.angle;
@@ -542,7 +646,15 @@ function stepPlayer(state, input, dt) {
   p.speed = 0;
 }
 
-function stepCarPhysics(state, car, throttle, steer, dt) {
+function stepCarPhysics(state, car, throttle, steer, dt, boost) {
+  // Nitro: hold Shift in the player's car for a 30% top-speed boost while
+  // the meter lasts. The meter refills in stepPlayer whenever the player is
+  // not boosting. Police cars never boost.
+  let top = car.maxSpeed;
+  if (car.kind === 'player' && boost && state.player.nitro > 0 && car.speed > 50) {
+    top = car.maxSpeed * NITRO_BOOST;
+    state.player.nitro = Math.max(0, state.player.nitro - NITRO_DRAIN * dt);
+  }
   if (throttle > 0) {
     car.speed += car.accel * dt;
   } else if (throttle < 0) {
@@ -559,7 +671,7 @@ function stepCarPhysics(state, car, throttle, steer, dt) {
   if (steer !== 0 && car.speed > car.maxSpeed * 0.5) {
     car.speed = Math.max(car.maxSpeed * 0.5, car.speed - 500 * dt);
   }
-  car.speed = clamp(car.speed, -car.reverseMax, car.maxSpeed);
+  car.speed = clamp(car.speed, -car.reverseMax, top);
   const grip = clamp(Math.abs(car.speed) / 120, 0.3, 1);
   car.angle += steer * car.turn * grip * Math.sign(car.speed || 1) * dt;
   const nx = clamp(car.x + Math.cos(car.angle) * car.speed * dt, 16, CITY_W - 16);
@@ -579,7 +691,20 @@ function stepCarPhysics(state, car, throttle, steer, dt) {
 function stepTraffic(state, dt) {
   const cars = state.cars;
   for (const car of cars) {
-    if (car.kind !== 'traffic') continue;
+    const isCourier = car.kind === 'courier';
+    if (car.kind !== 'traffic' && !isCourier) continue;
+    if (isCourier) {
+      // The courier cruises until the player closes in, then he runs — and
+      // he hesitates when the player is right beside him on foot.
+      if (car.stall > 0) {
+        car.stall -= dt;
+        car.speed = Math.max(0, car.speed - 400 * dt);
+      } else {
+        const pd = dist(car.x, car.y, state.player.x, state.player.y);
+        const onFootNear = !state.player.inCar && pd < 90;
+        car.targetSpeed = onFootNear ? 40 : pd < 240 ? 280 : 150;
+      }
+    }
     // Yield to a car ahead in the same lane and direction — and nothing else.
     let blocked = false;
     for (const other of cars) {
@@ -602,7 +727,8 @@ function stepTraffic(state, dt) {
     else car.x += car.dir * car.speed * dt;
     car.x = clamp(car.x, 16, CITY_W - 16);
     car.y = clamp(car.y, 16, CITY_H - 16);
-    maybeTurnTraffic(state, car, prevX, prevY);
+    // The courier turns more often than ordinary traffic — he is running.
+    maybeTurnTraffic(state, car, prevX, prevY, isCourier ? 0.5 : 0.3);
     // Safety net: a car shoved past the last intersection by a collision
     // would otherwise sit at the city's edge forever, and the cars behind
     // it would queue up into a jam. Force it onto the edge road.
@@ -627,8 +753,9 @@ function forceEdgeTurn(state, car, newAxis, edgeRoad) {
   car.angle = angleFor(newAxis, newDir);
 }
 
-function maybeTurnTraffic(state, car, prevX, prevY) {
+function maybeTurnTraffic(state, car, prevX, prevY, turnProb) {
   // Did the car cross a road centre on the perpendicular axis?
+  const p = turnProb ?? 0.3;
   for (let j = 0; j <= 5; j++) {
     const c = roadCenter(j);
     const crossed = car.axis === 'v'
@@ -640,7 +767,7 @@ function maybeTurnTraffic(state, car, prevX, prevY) {
       (car.axis === 'v' && ((car.dir > 0 && j === 5) || (car.dir < 0 && j === 0))) ||
       (car.axis === 'h' && ((car.dir > 0 && j === 5) || (car.dir < 0 && j === 0)))
     );
-    if (!mustTurn && state.rng() > 0.3) continue;
+    if (!mustTurn && state.rng() > p) continue;
     if (mustTurn && state.rng() < 0.5) {
       // U-turn at the edge of the city, snapping to the new direction's lane
       // so the car never drives head-on down its old lane.
@@ -766,7 +893,8 @@ function stepRivals(state, dt) {
       }
       if (d < 330 && r.shootCd <= 0) {
         r.shootCd = 1.4;
-        const aim = a + (state.rng() - 0.5) * 0.44;
+        // Bell-shaped aim error: most shots cluster near the player.
+        const aim = a + gauss(state.rng) * 0.22;
         state.bullets.push({
           x: r.x + Math.cos(aim) * 18, y: r.y + Math.sin(aim) * 18,
           vx: Math.cos(aim) * 500, vy: Math.sin(aim) * 500,
@@ -801,25 +929,29 @@ function stepPolice(state, dt) {
   const wantCars = state.wanted === 0 ? 0 : Math.min(state.wanted, 3);
   const wantFoot = state.wanted >= 3 ? Math.min(state.wanted - 2, 2) : 0;
 
-  // Spawn police cars on a nearby road when the heat rises.
+  // Spawn police cars on a nearby road when the heat rises. Higher heat
+  // means faster interceptors.
   let have = policeCarCount(state);
   while (have < wantCars) {
     const spot = nearestRoadSpotNear(state, p.x, p.y, 320);
     makeCar(state, {
       x: spot.x, y: spot.y, angle: 0,
       kind: 'police', driver: 'police', color: '#1c2733',
-      maxSpeed: 300, accel: 380, turn: 3.0,
+      maxSpeed: 280 + state.wanted * 12, accel: 380, turn: 3.0,
     });
     have++;
   }
   // Excess police leave the moment the heat drops.
   if (have > wantCars) {
-    const cops = state.cars.filter((c) => c.kind === 'police');
+    const cops = state.cars.filter((c) => c.kind === 'police' && !c.roadblock);
     cops.sort((a, b) => dist(b.x, b.y, p.x, p.y) - dist(a.x, a.y, p.x, p.y));
     for (let i = wantCars; i < cops.length; i++) {
       state.cars.splice(state.cars.indexOf(cops[i]), 1);
     }
   }
+  // At wanted 4 and 5 the police set a roadblock across the road ahead of
+  // the player. It lifts the moment the heat drops below 4.
+  ensureRoadblocks(state, dt);
   while (state.policeFoot.length < wantFoot) {
     const a = state.rng() * Math.PI * 2;
     state.policeFoot.push({
@@ -833,20 +965,31 @@ function stepPolice(state, dt) {
   }
 
   // Police cars drive the roads toward the player, then ram up close.
+  // They do not aim at where the player is — they aim at where the player
+  // will be, leading a moving car by its velocity. Roadblock cars stay
+  // parked where they were set.
   for (const cop of state.cars.filter((c) => c.kind === 'police')) {
+    if (cop.roadblock) continue;
     if (cop.ramCd > 0) cop.ramCd -= dt;
     const d = dist(cop.x, cop.y, p.x, p.y);
+    // Lead point: half a second ahead of a moving player.
+    let leadX = p.x;
+    let leadY = p.y;
+    if (p.inCar && p.car && Math.abs(p.car.speed) > 40) {
+      leadX = p.x + Math.cos(p.angle) * p.car.speed * 0.6;
+      leadY = p.y + Math.sin(p.angle) * p.car.speed * 0.6;
+    }
     let target;
     if (d < 70) {
       target = { x: p.x, y: p.y };
     } else {
       cop.routeTimer -= dt;
       if (!cop.route || cop.routeTimer <= 0 || cop.routeIndex >= cop.route.length) {
-        cop.route = routeWaypoints(cop.x, cop.y, p.x, p.y);
+        cop.route = routeWaypoints(cop.x, cop.y, leadX, leadY);
         cop.routeIndex = 0;
         cop.routeTimer = 0.8;
       }
-      target = cop.route[cop.routeIndex] || { x: p.x, y: p.y };
+      target = cop.route[cop.routeIndex] || { x: leadX, y: leadY };
       if (dist(cop.x, cop.y, target.x, target.y) < 40) cop.routeIndex += 1;
     }
     const desired = Math.atan2(target.y - cop.y, target.x - cop.x);
@@ -901,6 +1044,45 @@ function nearestRoadSpotNear(state, x, y, minDist) {
   }
   if (best) return best;
   return { x: roadCenter(0), y: roadCenter(0) };
+}
+
+// A roadblock: two police cars parked sideways across the road the player
+// is travelling along, about 380 px ahead. It only exists while wanted is
+// 4 or 5, and it is a wall the player has to drive around, not through.
+function ensureRoadblocks(state, dt) {
+  const p = state.player;
+  if (state.wanted < 4) {
+    if (state.cars.some((c) => c.roadblock)) {
+      state.cars = state.cars.filter((c) => !c.roadblock);
+    }
+    return;
+  }
+  if (state.cars.some((c) => c.roadblock)) return;
+  const heading = p.inCar && p.car ? p.car.angle : p.angle;
+  const ax = Math.cos(heading);
+  const ay = Math.sin(heading);
+  const aheadX = clamp(p.x + ax * 380, 60, CITY_W - 60);
+  const aheadY = clamp(p.y + ay * 380, 60, CITY_H - 60);
+  const horizontal = Math.abs(ax) >= Math.abs(ay);
+  const spots = horizontal
+    ? [
+      { x: aheadX, y: roadCenter(nearestRoadIndex(aheadY)) - 18, angle: Math.PI / 2 },
+      { x: aheadX, y: roadCenter(nearestRoadIndex(aheadY)) + 18, angle: Math.PI / 2 },
+    ]
+    : [
+      { x: roadCenter(nearestRoadIndex(aheadX)) - 18, y: aheadY, angle: 0 },
+      { x: roadCenter(nearestRoadIndex(aheadX)) + 18, y: aheadY, angle: 0 },
+    ];
+  for (const s of spots) {
+    const car = makeCar(state, {
+      x: s.x, y: s.y, angle: s.angle,
+      kind: 'police', driver: 'police', color: '#1c2733',
+      maxSpeed: 0, accel: 0,
+    });
+    car.roadblock = true;
+    car.speed = 0;
+  }
+  addToast(state, 'Roadblock ahead — go around it');
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +1150,26 @@ function stepPickups(state, dt) {
   }
 }
 
+function stepTags(state, dt) {
+  const p = state.player;
+  for (let i = 0; i < TAG_SPOTS.length; i++) {
+    if (state.tags[i]) continue;
+    const spot = TAG_SPOTS[i];
+    if (dist(p.x, p.y, spot.x, spot.y) < TAG_RADIUS) {
+      state.tags[i] = true;
+      state.tagsCollected += 1;
+      state.cash += TAG_REWARD;
+      spawnParticles(state, spot.x, spot.y, 10, '#ff4fd8', 130);
+      addToast(state, `Neon tag ${state.tagsCollected}/${TAG_SPOTS.length} — $${TAG_REWARD}`);
+      if (state.tagsCollected >= TAG_SPOTS.length && !state.tagBonusPaid) {
+        state.tagBonusPaid = true;
+        state.cash += TAG_BONUS;
+        addToast(state, `All tags found — Delia pays a $${TAG_BONUS} bonus`);
+      }
+    }
+  }
+}
+
 function stepParticles(state, dt) {
   for (const pt of state.particles) {
     pt.x += pt.vx * dt;
@@ -985,8 +1187,10 @@ function stepWanted(state, dt) {
     state.wantedTimer = 0;
     return;
   }
+  // At night the heat lingers: the city never really sleeps.
+  const decay = nightFactor(state) > 0.5 ? WANTED_DECAY_SECONDS_NIGHT : WANTED_DECAY_SECONDS;
   state.wantedTimer += dt;
-  if (state.wantedTimer >= WANTED_DECAY_SECONDS) {
+  if (state.wantedTimer >= decay) {
     state.wanted -= 1;
     state.wantedTimer = 0;
     if (state.wanted === 0) clearWanted(state);
@@ -1011,11 +1215,13 @@ export function snapshot(state) {
       ammo: p.ammo,
       inCar: p.inCar,
       carSpeed: Math.round(Math.abs(p.inCar && p.car ? p.car.speed : 0)),
+      nitro: Math.round(p.nitro),
     },
     cars: state.cars.map((c) => ({
       x: Math.round(c.x), y: Math.round(c.y),
       angle: Math.round(c.angle * 100) / 100,
       driver: c.driver, gold: c.gold, police: c.kind === 'police',
+      courier: c.kind === 'courier', roadblock: !!c.roadblock,
     })),
     peds: state.peds.map((w) => ({ x: Math.round(w.x), y: Math.round(w.y), hostile: false, down: false }))
       .concat(state.rivals.map((r) => ({ x: Math.round(r.x), y: Math.round(r.y), hostile: true, down: r.down })))
@@ -1027,7 +1233,11 @@ export function snapshot(state) {
     cash: state.cash,
     wanted: state.wanted,
     policeCars: policeCarCount(state),
+    roadblocks: state.cars.filter((c) => c.roadblock).length,
     rivalsLeft: rivalsLeft(state),
+    tags: state.tagsCollected,
+    tagsTotal: TAG_SPOTS.length,
+    courier: state.cars.some((c) => c.kind === 'courier'),
     timeOfDay: Math.round(state.timeOfDay * 100) / 100,
   };
 }

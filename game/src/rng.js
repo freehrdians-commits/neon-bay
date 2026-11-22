@@ -28,6 +28,24 @@ export function chance(rng, p) {
   return rng() < p;
 }
 
+// A roughly bell-shaped draw in [-1, 1], from the seeded generator — for
+// spreads that cluster near the middle instead of scattering flat.
+export function gauss(rng) {
+  return (rng() + rng() + rng() - 1.5) / 1.5;
+}
+
+// Pick one entry from [{ value, weight }] in proportion to its weight.
+export function weightedPick(rng, entries) {
+  let total = 0;
+  for (const e of entries) total += e.weight;
+  let roll = rng() * total;
+  for (const e of entries) {
+    roll -= e.weight;
+    if (roll <= 0) return e.value;
+  }
+  return entries[entries.length - 1].value;
+}
+
 // A shuffled copy of an array, using the seeded generator.
 export function shuffle(rng, list) {
   const out = list.slice();

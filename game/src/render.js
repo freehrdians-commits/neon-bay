@@ -5,7 +5,7 @@
 // the city.
 import { CITY_W, CITY_H, ROAD_WIDTH, MARKERS, roadCenter, clamp, dist } from './city.js';
 import { MISSIONS, objectiveFor } from './missions.js';
-import { nightFactor } from './world.js';
+import { nightFactor, TAG_SPOTS } from './world.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -174,6 +174,17 @@ export function createRenderer(canvas) {
         ctx.fillRect(roadCenter(i) + 30, roadCenter(j) - 34, 4, 8);
       }
     }
+    // Neon signs on building faces: dim by day, glowing after dark.
+    const night = nightFactor(state);
+    for (const s of state.city.signs || []) {
+      ctx.save();
+      if (night > 0.3) {
+        ctx.shadowColor = s.color;
+        ctx.shadowBlur = 14;
+      }
+      text(s.text, s.x, s.y, 13, s.color, 'center', 'bold');
+      ctx.restore();
+    }
   }
 
   function drawMarker(state) {
@@ -237,6 +248,35 @@ export function createRenderer(canvas) {
       roundRect(-18, -10, 36, 20, 5);
       ctx.stroke();
     }
+    if (car.kind === 'courier') {
+      // Marlow's ledger car: black with a gold racing stripe.
+      ctx.strokeStyle = '#e8c33a';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-18, 0);
+      ctx.lineTo(18, 0);
+      ctx.stroke();
+      ctx.fillStyle = '#e8c33a';
+      ctx.fillRect(-14, -7, 6, 4);
+      ctx.fillRect(-14, 3, 6, 4);
+    }
+    if (car.roadblock) {
+      // A striped barrier plank along the car's length, spanning the road.
+      ctx.strokeStyle = '#ff2e2e';
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(-28, 0);
+      ctx.lineTo(28, 0);
+      ctx.stroke();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 5;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(-28, 0);
+      ctx.lineTo(28, 0);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.restore();
   }
 
@@ -247,6 +287,24 @@ export function createRenderer(canvas) {
   }
 
   function drawEntities(state, cam, night) {
+    // Neon tags: pink spray stars that pulse until collected.
+    for (let i = 0; i < TAG_SPOTS.length; i++) {
+      if (state.tags[i]) continue;
+      const spot = TAG_SPOTS[i];
+      const pulse = 1 + 0.25 * Math.sin(state.time * 5 + i);
+      ctx.save();
+      ctx.translate(spot.x, spot.y);
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = '#ff4fd8';
+      ctx.beginPath();
+      ctx.arc(0, 0, 12 * pulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(0, 0, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
     // Pickups.
     for (const pk of state.pickups) {
       if (pk.timer > 0) continue;
@@ -382,8 +440,22 @@ export function createRenderer(canvas) {
     ctx.globalAlpha = 1;
   }
 
+  function duskFactor(state) {
+    // Sunrise (~0.00) and sunset (~0.55): a warm orange wash as the day
+    // turns, so the light changes smoothly instead of snapping to night.
+    const t = state.timeOfDay;
+    const sunset = 1 - Math.min(1, Math.abs(t - 0.55) / 0.05);
+    const sunrise = 1 - Math.min(1, Math.min(Math.abs(t), Math.abs(t - 1)) / 0.05);
+    return Math.max(0, Math.max(sunset, sunrise));
+  }
+
   function drawNight(state, cam) {
     const n = nightFactor(state);
+    const dusk = duskFactor(state);
+    if (dusk > 0.01) {
+      ctx.fillStyle = `rgba(255, 110, 40, ${0.13 * dusk})`;
+      ctx.fillRect(cam.x, cam.y, 1280, 720);
+    }
     if (n <= 0.01) return;
     ctx.fillStyle = `rgba(8, 12, 42, ${0.52 * n})`;
     ctx.fillRect(cam.x, cam.y, 1280, 720);
@@ -422,9 +494,9 @@ export function createRenderer(canvas) {
   function drawHud(state) {
     const p = state.player;
     const obj = objectiveFor(state.missionIndex, state.missionStage, state);
-    // Top-left: health, cash, ammo.
+    // Top-left: health, cash, ammo, nitro, tags.
     ctx.fillStyle = '#000000c8';
-    roundRect(14, 12, 250, 84, 8);
+    roundRect(14, 12, 250, 108, 8);
     ctx.fill();
     text('ROOK', 26, 34, 15, '#ffffff', 'left', 'bold');
     ctx.fillStyle = '#333';
@@ -433,6 +505,16 @@ export function createRenderer(canvas) {
     ctx.fillRect(26, 42, Math.max(0, 150 * p.health) / 100, 12);
     text(`$${state.cash}`, 26, 76, 18, '#7be382', 'left', 'bold');
     text(`AMMO ${p.ammo}`, 150, 76, 15, '#ffd76a', 'left', 'bold');
+    // Nitro meter, only while driving.
+    if (p.inCar) {
+      text('NITRO', 26, 98, 12, '#2ee6ff', 'left', 'bold');
+      ctx.fillStyle = '#333';
+      ctx.fillRect(80, 88, 150, 10);
+      ctx.fillStyle = '#2ee6ff';
+      ctx.fillRect(80, 88, Math.max(0, 150 * p.nitro) / 100, 10);
+    } else {
+      text(`TAGS ${state.tagsCollected}/${TAG_SPOTS.length}`, 26, 98, 12, '#ff4fd8', 'left', 'bold');
+    }
     // Top-right: wanted stars.
     ctx.fillStyle = '#000000c8';
     roundRect(1050, 12, 216, 44, 8);
@@ -464,7 +546,7 @@ export function createRenderer(canvas) {
     // Controls hint, early on.
     if (state.time < 25 && !state.dialog) {
       ctx.globalAlpha = 0.85;
-      text('WASD move/drive · E enter car / interact · F punch · Click shoot · Esc pause', 20, 706, 14, '#ffffff', 'left');
+      text('WASD move/drive · Shift nitro · E enter car / interact · F punch · Click shoot · Esc pause', 20, 706, 14, '#ffffff', 'left');
       ctx.globalAlpha = 1;
     }
     drawMinimap(state);
@@ -503,6 +585,17 @@ export function createRenderer(canvas) {
         ctx.fillRect(ox + car.x * k - 2, oy + car.y * k - 2, 4, 4);
       } else if (car.gold) {
         ctx.fillStyle = '#e8c33a';
+        ctx.fillRect(ox + car.x * k - 2, oy + car.y * k - 2, 4, 4);
+      } else if (car.kind === 'courier') {
+        // The ledger courier: a white diamond on the minimap.
+        ctx.fillStyle = '#ffffff';
+        ctx.save();
+        ctx.translate(ox + car.x * k, oy + car.y * k);
+        ctx.rotate(Math.PI / 4);
+        ctx.fillRect(-3, -3, 6, 6);
+        ctx.restore();
+      } else if (car.roadblock) {
+        ctx.fillStyle = '#ff2e2e';
         ctx.fillRect(ox + car.x * k - 2, oy + car.y * k - 2, 4, 4);
       }
     }
@@ -585,7 +678,7 @@ export function createRenderer(canvas) {
     ctx.fillRect(0, 0, 1280, 720);
     text('NEON BAY', 640, 210, 92, '#ffd21f', 'center', 'bold');
     text('An open-world crime story', 640, 258, 24, '#ffffff', 'center');
-    text('Rook is out. Delia has work. The city is yours.', 640, 292, 17, '#cccccc', 'center');
+    text('Four jobs. One ledger. The city is yours.', 640, 292, 17, '#cccccc', 'center');
     // Buttons.
     const b1 = BUTTONS.newGame;
     ctx.fillStyle = '#ffd21f';
@@ -627,7 +720,8 @@ export function createRenderer(canvas) {
     } else if (state.screen === 'complete') {
       drawPanel('STORY COMPLETE', [
         `Rook owns Neon Bay. Cash: $${state.cash}.`,
-        `Missions finished: ${state.missionsDone} of 3.`,
+        `Missions finished: ${state.missionsDone} of 4.`,
+        `Neon tags found: ${state.tagsCollected} of ${TAG_SPOTS.length}.`,
         'Delia is pouring something expensive.',
       ], 'Thanks for playing Neon Bay', '#37c24a');
     } else if (state.screen === 'gameover') {

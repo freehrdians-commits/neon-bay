@@ -104,6 +104,29 @@ export class SoundBank {
     notes.forEach((f, i) => setTimeout(() => this.blip(f, 0.3, 'sawtooth', 0.4), i * 160));
   }
 
+  // A neon tag collected: a bright two-note chime.
+  tag() {
+    this.blip(1319, 0.09, 'sine', 0.5);
+    setTimeout(() => this.blip(1760, 0.16, 'sine', 0.5), 80);
+  }
+
+  // The courier spots the player: a short warning sting.
+  alarm() {
+    this.blip(740, 0.1, 'square', 0.35);
+    setTimeout(() => this.blip(740, 0.1, 'square', 0.35), 140);
+    setTimeout(() => this.blip(988, 0.18, 'square', 0.35), 280);
+  }
+
+  // Tire screech for a hard turn at speed.
+  skid() {
+    this.noiseBurst(0.22, 0.35, 3200);
+  }
+
+  // Nitro whoosh when the boost kicks in.
+  nitro() {
+    this.noiseBurst(0.35, 0.45, 5200);
+  }
+
   // Continuous engine hum: pitch follows the driven car's speed.
   setEngine(speedRatio, inCar) {
     try {

@@ -1,7 +1,10 @@
-// The story of Neon Bay: three jobs for Rook, a driver fresh out of the
+// The story of Neon Bay: four jobs for Rook, a driver fresh out of the
 // east-side lockup, working for Delia Vane, who runs a garage on the
-// waterfront. Pure data — the world asks this file where the player has to go
-// next and what the briefing says; the world itself runs the consequences.
+// waterfront. The arc runs from a first errand to the ledger that owns the
+// whole city: Delia's rival Marlow keeps his payoffs in one black book, and
+// his courier drives it through Neon Bay every night. Pure data — the world
+// asks this file where the player has to go next and what the briefing says;
+// the world itself runs the consequences.
 import { MARKERS } from './city.js';
 
 export const MISSIONS = [
@@ -38,6 +41,19 @@ export const MISSIONS = [
       'The cops are paid to look away tonight. When the plaza is yours, come home.',
     ],
   },
+  {
+    key: 'the-ledger',
+    title: 'The Ledger',
+    speaker: 'Delia Vane',
+    reward: 2000,
+    briefing: [
+      'One more job, and then we own this city, Rook.',
+      'Marlow keeps every name, every debt, every payoff in one black ledger.',
+      'His courier drives it through Neon Bay in a black Comet. Take it off him.',
+      'Cut the car off and grab it — on foot, up close. Then bring it to my contact at the docks.',
+      'The cops will NOT look away this time. Hold Shift in the car for nitro when you need to run.',
+    ],
+  },
 ];
 
 // Where the player has to go, for the current mission and stage. `action`
@@ -64,6 +80,14 @@ export function objectiveFor(missionIndex, missionStage, state) {
   }
   if (missionIndex === 2 && missionStage === 1) {
     return { key: 'garage', x: MARKERS.garage.x, y: MARKERS.garage.y, label: 'Return to the garage', action: 'deliver' };
+  }
+  if (missionIndex === 3 && missionStage === 0) {
+    const courier = state.cars.find((c) => c.kind === 'courier');
+    if (!courier) return null;
+    return { key: 'courier', x: courier.x, y: courier.y, label: 'Cut off the courier — grab the ledger', action: null };
+  }
+  if (missionIndex === 3 && missionStage === 1) {
+    return { key: 'docks', x: MARKERS.docks.x, y: MARKERS.docks.y, label: 'Deliver the ledger to the docks', action: 'deliver' };
   }
   return null;
 }

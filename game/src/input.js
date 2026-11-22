@@ -15,6 +15,8 @@ export class Input {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Tab'].includes(e.code)) {
         e.preventDefault();
       }
+      // Shift is the nitro key: never let the browser steal it for focus.
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') e.preventDefault();
       if (!e.repeat) this.pressed.add(e.code);
       this.keys.add(e.code);
     });
@@ -44,6 +46,11 @@ export class Input {
 
   down(...codes) {
     return codes.some((c) => this.keys.has(c));
+  }
+
+  // Nitro: either Shift key held down.
+  boost() {
+    return this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
   }
 
   // True once, on the frame the key went down; cleared each frame by endFrame.

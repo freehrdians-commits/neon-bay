@@ -3,8 +3,9 @@
 // no network request — and this program hands them in: it copies game/ and
 // screenshots/ from beside this file into the output directory and writes
 // dossier.json, the summary the judge reads, using the vendored make.fun
-// library. The grader runs this twice and both runs must write the same bytes,
-// so nothing here depends on the time or the machine.
+// library. It also writes a small manifest.json describing the build. The
+// grader runs this twice and both runs must write the same bytes, so nothing
+// here depends on the time or the machine.
 //
 // Run it locally with:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -12,7 +13,7 @@
 // used instead.) Serve the game itself with `node serve.ts`, then open
 // http://localhost:8080.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -26,6 +27,17 @@ function copyTree(from, to) {
   cpSync(from, to, { recursive: true });
 }
 
+// Count the files under a directory, recursively — a stable number for the
+// manifest, since the file list itself never changes between runs.
+function countFiles(dir) {
+  let n = 0;
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    n += statSync(full).isDirectory() ? countFiles(full) : 1;
+  }
+  return n;
+}
+
 mkdirSync(outputDir, { recursive: true });
 copyTree(join(repoRoot, 'game'), join(outputDir, 'game'));
 if (existsSync(join(repoRoot, 'screenshots'))) {
@@ -33,6 +45,16 @@ if (existsSync(join(repoRoot, 'screenshots'))) {
 } else {
   mkdirSync(join(outputDir, 'screenshots'), { recursive: true });
 }
+
+// A deterministic manifest: the game's name, its four story jobs, and how
+// many files the build holds. No timestamps, no machine facts.
+const manifest = {
+  game: 'Neon Bay',
+  missions: ['First Job', 'Hot Wheels', 'Turf War', 'The Ledger'],
+  game_files: countFiles(join(outputDir, 'game')),
+  offline: true,
+};
+writeFileSync(join(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 
 // The caps are the scorer's own: only the text cap shapes the bytes, the
 // rest refuse an entry the scorer would refuse — more than 4 screenshots or
