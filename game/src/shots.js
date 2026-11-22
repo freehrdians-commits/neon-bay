@@ -1,79 +1,141 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|play|chase|end. Each one plays the real
+// rules forward from a fresh world for a fixed number of steps, steered by a simple
+// road-following autopilot, so the frame is what a short game really looks like and
+// the same seed always gives the same frame.
+
+import { STEP } from './config.js';
+import { SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 
 const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
+const PLAY_SECONDS = 24;
+const CHASE_SECONDS = 9;
+
+/** A controls object that does nothing — the title backdrop just lets the city live. */
+function neutralControls() {
+  return {
+    drive: () => ({ throttle: 0, steer: 0 }),
+    walk: () => ({ x: 0, y: 0 }),
+    nitroHeld: () => false,
+    takeInteract: () => false,
+    takeAttack: () => false,
+    takeActions: () => 0,
+  };
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
 /**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
+ * An autopilot that drives the player's car along the road grid toward a waypoint:
+ * first along the current road to the target's road, then down it. It steers toward
+ * the next waypoint and eases off the throttle when it must turn sharply.
  */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+function roadPilot(world) {
+  let waypoints = null;
+  function buildWaypoints() {
+    const p = world.state.player;
+    const t = world.state.mission.target;
+    const px = p.onFoot ? p.x : p.car.x;
+    const py = p.onFoot ? p.y : p.car.y;
+    // Nearest road centreline to the player on each axis, then to the target.
+    const roads = [0, 264, 528, 792, 1056, 1320];
+    const nearest = (v) => roads.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a));
+    const rx = nearest(px);
+    const ry = nearest(py);
+    const tx = nearest(t.x);
+    const ty = nearest(t.y);
+    waypoints = [
+      { x: rx, y: ry },
+      { x: tx, y: ry },
+      { x: tx, y: ty },
+      { x: t.x, y: t.y },
+    ];
   }
-  return Infinity;
+  buildWaypoints();
+  return {
+    drive() {
+      const p = world.state.player;
+      if (!p.car) return { throttle: 0, steer: 0 };
+      let wp = waypoints[0];
+      while (waypoints.length > 1 && Math.hypot(wp.x - p.car.x, wp.y - p.car.y) < 50) {
+        waypoints.shift();
+        wp = waypoints[0];
+      }
+      const want = Math.atan2(wp.y - p.car.y, wp.x - p.car.x);
+      const turn = angleDiff(want, p.car.angle);
+      const steer = clamp(turn * 1.6, -1, 1);
+      const throttle = Math.abs(turn) > 1.1 ? 0.3 : 1;
+      return { throttle, steer };
+    },
+    walk: () => ({ x: 0, y: 0 }),
+    nitroHeld: () => false,
+    takeInteract: () => false,
+    takeAttack: () => false,
+    takeActions: () => 0,
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function putPlayerInCar(world) {
+  const p = world.state.player;
+  const own = world.state.cars.find((c) => c.id === 'own');
+  p.onFoot = false;
+  p.car = own;
+  own.parked = false;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it.
+ * start: the title over a living city. play: Rook driving to the docks for job one.
+ * chase: night, wanted 4, police and a roadblock. end: the story complete screen.
  */
 export function stageShot(name, world) {
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  const controls = neutralControls();
+  if (name !== 'play' && name !== 'chase' && name !== 'end') {
+    for (let i = 0; i < START_SECONDS / STEP; i += 1) world.step(STEP, controls);
+    return { screen: SCREEN_TITLE };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'play') {
+    putPlayerInCar(world);
+    const pilot = roadPilot(world);
+    for (let i = 0; i < PLAY_SECONDS / STEP; i += 1) world.step(STEP, pilot);
+    return { screen: SCREEN_PLAY };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'chase') {
+    // Night, wanted 4, a chase already in progress: the car is tough for the
+    // staging so the scene survives its own police, and the roadblock spawns
+    // ahead on the road as the car drives east toward the docks.
+    world.state.elapsed = 0.8 * 240;
+    putPlayerInCar(world);
+    world.state.player.car.health = 500;
+    world.state.player.health = 500;
+    world.state.player.wanted = 4;
+    world.state.player.x = 660;
+    world.state.player.y = 792;
+    world.state.player.car.x = 660;
+    world.state.player.car.y = 792;
+    world.state.player.car.angle = 0;
+    const pilot = roadPilot(world);
+    for (let i = 0; i < CHASE_SECONDS / STEP; i += 1) world.step(STEP, pilot);
+    return { screen: SCREEN_PLAY };
+  }
+  // end: the ledger delivered, the story done, tags collected.
+  world.state.player.cash = 4400;
+  world.state.player.x = 1300;
+  world.state.player.y = 660;
+  for (const tag of world.city.tags) tag.taken = true;
+  world.state.tagsTaken = 8;
+  world.state.mission.index = 4;
+  world.state.storyComplete = true;
+  world.state.mission.text = 'Story complete — Neon Bay is yours, Rook.';
+  for (let i = 0; i < 3 / STEP; i += 1) world.step(STEP, controls);
+  return { screen: SCREEN_WIN };
 }
