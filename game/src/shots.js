@@ -1,79 +1,73 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|play|chase|end. Each one resets the world and then
+// sets up a real state through the world's own helpers — a car placed and driven, police
+// spawned, a roadblock staged, the story finished — and steps it a few frames, so the frame is
+// what the game really looks like and the same seed always gives the same frame.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { PLACES } from './city.js';
+import { SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
-}
+const IDLE = { mx: 0, my: 0, sneak: false, nitro: false, brake: false, aimAngle: 0, shooting: false, actions: 0 };
+const DRIVE = { mx: 0, my: -1, sneak: false, nitro: true, brake: false, aimAngle: 0, shooting: false, actions: 0 };
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function stepFor(world, seconds, controls) {
+  const steps = Math.round(seconds * 60);
+  for (let i = 0; i < steps; i++) world.step(1 / 60, controls);
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it.
+ * start: the title over a living city at dusk. play: driving with nitro, wanted 2, police
+ * behind. chase: wanted 4 at night, a roadblock across the road ahead. end: the story
+ * complete at the docks.
  */
 export function stageShot(name, world) {
+  const state = world.state;
+  if (name === 'play') {
+    world.reset();
+    state.timeOfDay = 0.58;
+    world.setMission(0, 1);
+    world.placePlayerCar(420, 576, 0);
+    const car = state.player.inCar;
+    car.speed = 300;
+    world.setWanted(2);
+    world.spawnPoliceAt(240, 576);
+    world.spawnPoliceAt(700, 320);
+    stepFor(world, 1.2, DRIVE);
+    return { screen: SCREEN_PLAY };
+  }
+  if (name === 'chase') {
+    world.reset();
+    state.timeOfDay = 0.78;
+    world.setMission(3, 0);
+    world.placePlayerCar(420, 576, 0);
+    const car = state.player.inCar;
+    car.speed = 320;
+    car.nitro = 62;
+    world.setWanted(4);
+    world.spawnRoadblockAt(800, 576, 0);
+    world.spawnPoliceAt(240, 576);
+    world.spawnPoliceAt(640, 320);
+    world.spawnPoliceAt(900, 832);
+    stepFor(world, 0.8, DRIVE);
+    return { screen: SCREEN_PLAY };
+  }
+  if (name === 'end') {
+    world.reset();
+    state.timeOfDay = 0.58;
+    world.setMission(4, 0);
+    state.mission = 4;
+    state.storyComplete = true;
+    state.cash = 4925;
+    for (const tag of state.tags) tag.got = true;
+    state.tagsGot = state.tags.length;
+    world.placePlayer(PLACES.docks.x, PLACES.docks.y - 40, -Math.PI / 2);
+    stepFor(world, 0.5, IDLE);
+    state.storyComplete = true;
+    return { screen: SCREEN_WIN };
+  }
+  // start (and any other name): the title over the city at dusk, traffic moving.
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
-  }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  state.timeOfDay = 0.58;
+  stepFor(world, 5, IDLE);
+  return { screen: SCREEN_TITLE };
 }
